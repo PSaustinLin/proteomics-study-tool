@@ -10,7 +10,7 @@ def combine_figures_in_memory(peptide_fig, spectrum_fig):
     def fig_to_pil_image(fig):
         # Save figure to a bytes buffer
         buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=600, bbox_inches='tight', pad_inches=0, transparent=True)
+        fig.savefig(buf, format='tiff', dpi=600, bbox_inches='tight', pad_inches=0, transparent=True)
         buf.seek(0)
         return Image.open(buf)
     
@@ -599,25 +599,39 @@ class CrosslinkedMS2Annotator:
         max_mz = np.max(mz_values)
         
         # Find matched and unmatched peaks
+        # When csv_input is used, only the ions listed in the CSV are "matched" —
+        # every other peak (including ones whose ions were manually deleted) is unmatched.
         unmatched_indices = []
         matched_indices = set()
         
-        for i, mz in enumerate(mz_values):
-            is_matched = False
-            for ion_type, ions in [('αb', alpha_b_ions), ('αy', alpha_y_ions),
-                                ('βb', beta_b_ions), ('βy', beta_y_ions),
-                                ('α', alpha_sig_ions), ('β', beta_sig_ions),
-                                ('M', precursor_ions)]:
-                for theoretical_mz, pos, charge, ion_label, sig_type in ions:
-                    abs_tolerance = self._calculate_tolerance(theoretical_mz, self.tolerance)
-                    if abs(mz - theoretical_mz) <= abs_tolerance:
-                        matched_indices.add(i)
-                        is_matched = True
+        if csv_input:
+            # Build the set of matched m/z values directly from the annotations that
+            # were loaded from the CSV.  Each annotation carries the observed m/z of
+            # the peak it was matched to, so we use a small window (0.005 Da) to map
+            # back to the raw spectrum index.
+            csv_matched_mzs = np.array([ann['mz'] for ann in all_annotations])
+            for i, mz in enumerate(mz_values):
+                if len(csv_matched_mzs) > 0 and np.min(np.abs(csv_matched_mzs - mz)) <= 0.005:
+                    matched_indices.add(i)
+                else:
+                    unmatched_indices.append(i)
+        else:
+            for i, mz in enumerate(mz_values):
+                is_matched = False
+                for ion_type, ions in [('αb', alpha_b_ions), ('αy', alpha_y_ions),
+                                    ('βb', beta_b_ions), ('βy', beta_y_ions),
+                                    ('α', alpha_sig_ions), ('β', beta_sig_ions),
+                                    ('M', precursor_ions)]:
+                    for theoretical_mz, pos, charge, ion_label, sig_type in ions:
+                        abs_tolerance = self._calculate_tolerance(theoretical_mz, self.tolerance)
+                        if abs(mz - theoretical_mz) <= abs_tolerance:
+                            matched_indices.add(i)
+                            is_matched = True
+                            break
+                    if is_matched:
                         break
-                if is_matched:
-                    break
-            if not is_matched:
-                unmatched_indices.append(i)
+                if not is_matched:
+                    unmatched_indices.append(i)
 
         ax_spectrum.vlines(mz_values[unmatched_indices], 
                         0, 
@@ -711,7 +725,7 @@ class CrosslinkedMS2Annotator:
             
             # Plot m/z value
             ax_spectrum.text(ann['mz'], y_pos - 2.0, #default -1
-                            f'{ann["mz"]:.3f}',
+                            f'{ann["mz"]:.1f}',
                             ha='center',
                             va='bottom',
                             color='grey',
@@ -805,7 +819,7 @@ class CrosslinkedMS2Annotator:
         
         # Get spectrum limits
         #spectrum_xlim = [min_mz, max_mz]
-        spectrum_xlim = [450, 1150]
+        spectrum_xlim = [200, 1300]
         #spectrum_xlim[1] += (spectrum_xlim[1] - spectrum_xlim[0]) * 0.1  # Add 10% more space
         ax_spectrum.set_xlim(spectrum_xlim)
         
@@ -922,9 +936,14 @@ class CrosslinkedMS2Annotator:
         if output_file:
             # Combine figures in memory
             combined_img = combine_figures_in_memory(fig_peptide, fig_spectrum)
-            
-            # Save the combined image
-            combined_img.save(output_file, dpi=(600, 600), transparent=True)
+
+            # Save the combined image (support TIFF output by extension)
+            output_ext = output_file.lower().split('.')[-1]
+            if output_ext in ('tif', 'tiff'):
+                # Use TIFF format explicitly (can preserve RGBA and high quality)
+                combined_img.save(output_file, format='TIFF', dpi=(600, 600), compression='tiff_deflate')
+            else:
+                combined_img.save(output_file, dpi=(600, 600), transparent=True)
         else:
             # If no output file, just show the figures
             plt.show()
@@ -969,21 +988,21 @@ class CrosslinkedMS2Annotator:
 
 if __name__ == "__main__":
     annotator = CrosslinkedMS2Annotator(
-        ms2_file=r'C:\Crux\data\20250520\20250520-TYG_9-1555-60T.ms2',
+        ms2_file=r'C:\Crux\data\20250427\20250427-TYG_2-1555-60T.ms2',
         alpha_sequence='EPCVESLVSQYFQTVTDYGK',
         beta_sequence='LGMFNIQHCK',
-        scan_number=33214,
+        scan_number=53852,
         alpha_modifications={}, # 23: 15.99491
         beta_modifications={},
         alpha_crosslink_site=3,
         beta_crosslink_site=9,
         crosslinker_mass=-2.01565,
         #tolerance=0.1  # Specify tolerance in Da (0.5 for IT, 0.1 for OT with 15k resolution)
-        tolerance='200ppm'  # Specify tolerance in ppm
+        tolerance=1  # Specify tolerance in ppm
     )
-    output_dir = r'C:\Crux\xlOutput\AA\0130'
+    output_dir = r'C:\Crux\xlOutput\20250427_ds\HCC60T\selected'
     annotator.annotate_crosslinked_spectrum(
-        output_file=r'{}\{}.png'.format(output_dir, annotator.scan_number),
+        output_file=r'{}\{}.tiff'.format(output_dir, annotator.scan_number),
         csv_output=r'{}\{}_matched_ions.csv'.format(output_dir, annotator.scan_number),
         csv_input=r'{}\{}_input_ions.csv'.format(output_dir, annotator.scan_number)
         #csv_input=None
