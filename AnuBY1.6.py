@@ -14,8 +14,8 @@ import multiprocessing as mp              # OPT: true parallelism for CPU parsin
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # GLOBAL Constants
-BIN_WIDTH = 0.02
-BIN_OFFSET = 0.4
+BIN_WIDTH = 1.0
+BIN_OFFSET = 0.04
 cid = True
 crosslinker = 'disulfide'
 
@@ -118,6 +118,14 @@ def read_peptides(file_path: str) -> Tuple[List[str], List[Dict[int, float]], Li
 
     print(f"Peptides read: {peptides[:5]}... ({len(peptides)} total)")
     return peptides, modifications, crosslink_sites, accessions
+
+
+def format_modifications(modifications: Dict[int, float]) -> str:
+    """Format modification dictionary as a CSV-friendly string."""
+    if not modifications:
+        return ''
+    return ','.join(f"{site}_{mass:.4f}" for site, mass in sorted(modifications.items()))
+
 
 def generate_all_combinations(peptides: List[str], modifications: List[Dict[int, float]],
                              crosslink_sites: List[int], accessions: List[str],
@@ -594,7 +602,7 @@ def compute_xcorr_enhanced(theoretical_spectrum: torch.Tensor, observed_spectrum
     # Ensure both spectra are on the same device
     theoretical_spectrum = theoretical_spectrum.to(device)
     
-    # Calculate simple dot product as in xcorr_example.py
+    # Calculate simple dot product
     xcorr_score = torch.dot(theoretical_spectrum, observed_spectrum) / normalization_factor
     
     return xcorr_score.item()
@@ -815,7 +823,7 @@ def process_spectrum_enhanced(
 
     for rank, orig_idx in enumerate(passing):
         xcorr = float(xcorr_cpu[rank])
-        if xcorr >= 2.0:
+        if xcorr >= 0.0: ### XCorr >= 2.0
             alpha_pep  = alpha_peptides[orig_idx]
             beta_pep   = beta_peptides[orig_idx]
             alpha_mod  = alpha_modifications[orig_idx]
@@ -832,10 +840,12 @@ def process_spectrum_enhanced(
             results.append((
                 scan_num, alpha_pep, beta_pep,
                 alpha_site, beta_site,
+                format_modifications(alpha_mod),
+                format_modifications(beta_mod),
                 _calculate_peptide_mass(aa_dict, alpha_pep, alpha_mod),
                 _calculate_peptide_mass(aa_dict, beta_pep,  beta_mod),
                 theo_mass, obs_mass, mass_diff,
-                ppm_diff, xcorr
+                ppm_diff, xcorr, charge
             ))
 
     return results
@@ -952,9 +962,9 @@ def process_spectrum(aa_dict: Dict[str, float], signature_types: Dict[str, float
             
         theoretical_mass = _calculate_peptide_mass(aa_dict, alpha_peptide, alpha_modification) + _calculate_peptide_mass(aa_dict, beta_peptide, beta_modification) + crosslinker_mass
         mass_diff = precursor_mass - theoretical_mass
-        if mass_diff > -20.0:
-            ppm_diff = abs(1E+6 * mass_diff / theoretical_mass)
+        ppm_diff = abs(1E+6 * mass_diff / theoretical_mass)
 
+        if ppm_diff <= 10.0:
             alpha_b, alpha_y, beta_b, beta_y, alpha_sig_ions, beta_sig_ions = calculate_alpha_ions(
                 aa_dict, signature_types, alpha_peptide, alpha_modification, 
                 alpha_crosslink_site, beta_peptide, beta_modification, 
@@ -975,7 +985,7 @@ def process_spectrum(aa_dict: Dict[str, float], signature_types: Dict[str, float
             
             # Output criteria for resolving the IO bottleneck
             if xcorr >= 2.0:
-                results.append((scan_num, alpha_peptide, beta_peptide, alpha_crosslink_site, beta_crosslink_site, _calculate_peptide_mass(aa_dict, alpha_peptide, alpha_modification), _calculate_peptide_mass(aa_dict, beta_peptide, beta_modification), theoretical_mass, precursor_mass, mass_diff, ppm_diff, xcorr))
+                results.append((scan_num, alpha_peptide, beta_peptide, alpha_crosslink_site, beta_crosslink_site, _calculate_peptide_mass(aa_dict, alpha_peptide, alpha_modification), _calculate_peptide_mass(aa_dict, beta_peptide, beta_modification), theoretical_mass, precursor_mass, mass_diff, ppm_diff, xcorr, charge))
     
     return results
 
@@ -1073,7 +1083,10 @@ def process_scan_block(scan_block: List[str]) -> Tuple[str, List[Tuple[float, fl
                 except ValueError:
                     charge = 0
             if precursor_mz > 0.0 and charge > 0:
-                precursor_mass = precursor_mz * charge - charge * proton_mass
+                # Some MS/MS scan fetches the highest isotope in an envelope. Store iso_num for caluclating the b/y ions with the correct isotope peaks
+                iso_precursor_mass = precursor_mz * charge - charge * proton_mass
+                precursor_mass = float(parts[2]) - proton_mass
+                iso_num = round(iso_precursor_mass - precursor_mass / proton_mass)
         elif not line.startswith(('H', 'I')):
             try:
                 mz, intensity = map(float, line.split())
@@ -1121,70 +1134,139 @@ def process_scan_group(scan_blocks: List[List[str]], output_queue: Queue,
             results.extend(scan_results)
     output_queue.put(results)
 
-def build_spectrum_chunks(
-        alpha_peptides: List[str], alpha_modifications: List[Dict[int, float]],
-        alpha_crosslink_sites: List[int],
-        beta_peptides: List[str], beta_modifications: List[Dict[int, float]],
-        beta_crosslink_sites: List[int],
+def score_chunk_against_file(
+        distributed_scans: List,
+        theo_matrix: torch.Tensor,
+        pair_masses: List[float],
+        c_alpha_pep: List[str],
+        c_alpha_mod: List[Dict[int, float]],
+        c_alpha_site: List[int],
+        c_beta_pep: List[str],
+        c_beta_mod: List[Dict[int, float]],
+        c_beta_site: List[int],
         crosslinker_mass: float,
-        aa_dict: Dict[str, float], signature_types: Dict[str, float],
-        device: torch.device) -> List[dict]:
+        aa_dict: Dict[str, float],
+        device: torch.device,
+        csv_writer) -> int:
     """
-    Precompute all theoretical spectra ONCE and return them as a list of
-    RAM-safe chunk dicts.  Called once in main() before the MS2 file loop —
-    the same chunks are reused for every MS2 file without re-computation.
+    Score all scans in `distributed_scans` against a single precomputed chunk
+    (theo_matrix / pair_masses) and write any hits directly to `csv_writer`.
 
-    MEMORY-SAFE CHUNKING
-    --------------------
-    The full theoretical-spectrum matrix for N pairs at 100,001 bins × 4 B can
-    easily exceed available RAM (e.g. 213 K pairs → ~85 GB).  Instead of
-    allocating the whole matrix at once we split the pair list into slices
-    whose matrix fits within 25 % of total installed RAM and precompute each
-    slice here.
-
-    Returns
-    -------
-    List of dicts, each containing:
-        theo_matrix            : torch.Tensor [chunk_len, BIN_COUNT] on `device`
-        pair_masses            : List[float]  [chunk_len]
-        alpha_peptides         : slice of the full alpha list
-        alpha_modifications    : slice
-        alpha_crosslink_sites  : slice
-        beta_peptides          : slice of the full beta list
-        beta_modifications     : slice
-        beta_crosslink_sites   : slice
+    Returns the number of result rows written.
     """
+    output_queue: Queue = Queue()
+    error_queue:  Queue = Queue()
+    num_threads = max(1, (os.cpu_count() or 2) - 1)
+
+    # OPT: ThreadPoolExecutor is kept (not ProcessPoolExecutor) because:
+    #   - theo_matrix is a GPU tensor and cannot be pickled across processes.
+    #   - The remaining CPU work (scan parsing + numpy ppm filter) releases
+    #     the GIL, so threads still provide genuine parallelism for that part.
+    #   - All GPU calls serialise on the CUDA stream regardless of executor type.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [
+            executor.submit(
+                process_scan_group,
+                scan_group, output_queue,
+                theo_matrix,  pair_masses,
+                c_alpha_pep,  c_alpha_mod,  c_alpha_site,
+                c_beta_pep,   c_beta_mod,   c_beta_site,
+                crosslinker_mass, aa_dict, device
+            )
+            for scan_group in distributed_scans
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"Error in thread: {e}")
+                traceback.print_exc()
+
+    while not error_queue.empty():
+        thread_idx, error_msg, tb_str = error_queue.get()
+        print(f"\nError in thread {thread_idx}:\n{error_msg}\n{tb_str}")
+
+    n_written = 0
+    while not output_queue.empty():
+        for result in output_queue.get():
+            csv_writer.writerow(result)
+            n_written += 1
+
+    return n_written
+
+
+def main(peptides_csv_path: str, output_directory: str, ms2_file_paths: List[str],
+         crosslinker_mass: float, aa_dict: Dict[str, float],
+         signature_types: Dict[str, float], device: torch.device,
+         alpha_acc: List[str]):
     import psutil
 
-    n_pairs   = len(alpha_peptides)
-    bin_count = int(2000.0 / BIN_WIDTH) + 1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Target ≤ 25 % of total installed RAM per chunk.
-    # Using total (not currently-available) gives a stable machine-level budget
-    # that is not perturbed by transient OS cache pressure.
+    # Read peptides from a single CSV file (returns accessions as 4th value)
+    peptides, modifications, crosslink_sites, accessions = read_peptides(peptides_csv_path)
+
+    # Generate all alpha/beta pair combinations
+    (alpha_peptides, alpha_modifications, alpha_crosslink_sites,
+     beta_peptides, beta_modifications, beta_crosslink_sites) = generate_all_combinations(
+         peptides, modifications, crosslink_sites, accessions, alpha_acc, crosslinker)
+
+    # ── Chunk size: target 40 % of total RAM for ONE chunk ────────────────────
+    # Only one chunk is ever live in RAM at a time (build → score all files →
+    # del → next chunk), so 40 % of total is safe regardless of how many chunks
+    # there are.  Previous code accumulated ALL chunks before scoring anything,
+    # which multiplied peak RAM by n_chunks.
+    n_pairs    = len(alpha_peptides)
+    bin_count  = int(2000.0 / BIN_WIDTH) + 1
     CHUNK_RAM_FRAC = 0.4
     total_ram_mb   = psutil.virtual_memory().total / 1e6
     target_mb      = total_ram_mb * CHUNK_RAM_FRAC
-    bytes_per_pair = bin_count * 4  # float32
+    bytes_per_pair = bin_count * 4   # float32
     CHUNK_SIZE     = max(1, int(target_mb * 1e6 / bytes_per_pair))
-
-    full_matrix_mb = n_pairs * bin_count * 4 / 1e6
     n_chunks       = (n_pairs + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-    print(f"\nBuilding theoretical spectrum chunks (computed ONCE, reused for every MS2 file):")
+    print(f"\nStreaming theoretical spectra (1 chunk live at a time):")
     print(f"  Total pairs      : {n_pairs:,}")
-    print(f"  Full matrix size : {full_matrix_mb:.0f} MB")
+    print(f"  Full matrix size : {n_pairs * bin_count * 4 / 1e6:.0f} MB")
     print(f"  Total RAM        : {total_ram_mb:.0f} MB")
     print(f"  Chunk size       : {CHUNK_SIZE:,} pairs  "
           f"({CHUNK_SIZE * bin_count * 4 / 1e6:.0f} MB / chunk)")
     print(f"  Number of chunks : {n_chunks}")
 
-    chunks = []
+    # ── Parse every MS2 file ONCE up front (text only, cheap RAM) ────────────
+    num_threads = max(1, (os.cpu_count() or 2) - 1)
+    parsed_scans: Dict[str, List] = {}
+    for file_path in ms2_file_paths:
+        print(f"  Parsing: {file_path}")
+        scans = split_ms2_by_scans(file_path)
+        parsed_scans[file_path] = distribute_scans(scans, num_threads)
+
+    # ── Open all output CSV files ─────────────────────────────────────────────
+    output_handles = {}
+    csv_writers    = {}
+    result_counts  = {fp: 0 for fp in ms2_file_paths}
+    for file_path in ms2_file_paths:
+        out_path = os.path.join(output_directory,
+                                f"xl_ds_{os.path.basename(file_path).split('.')[0]}.csv")
+        fh = open(out_path, 'w', newline='')
+        w  = csv.writer(fh)
+        w.writerow(['Scan', 'Alpha Peptide', 'Beta Peptide',
+                'Alpha XL Site', 'Beta XL Site',
+                'Alpha Mods', 'Beta Mods',
+                'Alpha Mass', 'Beta Mass',
+                'Theoretical Mass', 'Observed Mass',
+                'Mass_Diff', 'PPM_Diff', 'Xcorr', 'Charge'])
+        output_handles[file_path] = fh
+        csv_writers[file_path]    = w
+
+    # ── Stream: build one chunk → score ALL MS2 files → free → next chunk ────
     for chunk_idx, chunk_start in enumerate(range(0, n_pairs, CHUNK_SIZE)):
-        chunk_end = min(chunk_start + CHUNK_SIZE, n_pairs)
-        print(f"  Precomputing chunk {chunk_idx + 1}/{n_chunks} "
+        chunk_end    = min(chunk_start + CHUNK_SIZE, n_pairs)
+        chunk_len    = chunk_end - chunk_start
+        chunk_t0     = current_time()
+
+        print(f"\n  Building chunk {chunk_idx + 1}/{n_chunks} "
               f"(pairs {chunk_start:,}–{chunk_end - 1:,})...", flush=True)
-        chunk_t0 = current_time()
 
         c_alpha_pep  = alpha_peptides        [chunk_start:chunk_end]
         c_alpha_mod  = alpha_modifications   [chunk_start:chunk_end]
@@ -1199,135 +1281,38 @@ def build_spectrum_chunks(
             c_beta_pep,  c_beta_mod,  c_beta_site,
             crosslinker_mass, max_charge=4, device=device)
 
-        chunks.append(dict(
-            theo_matrix           = theo_matrix,
-            pair_masses           = pair_masses,
-            alpha_peptides        = c_alpha_pep,
-            alpha_modifications   = c_alpha_mod,
-            alpha_crosslink_sites = c_alpha_site,
-            beta_peptides         = c_beta_pep,
-            beta_modifications    = c_beta_mod,
-            beta_crosslink_sites  = c_beta_site,
-        ))
-        print(f"  Chunk {chunk_idx + 1}/{n_chunks} done  "
-              f"({format_runtime(chunk_t0, current_time())})")
+        print(f"  Chunk {chunk_idx + 1}/{n_chunks} built  "
+              f"({format_runtime(chunk_t0, current_time())})  "
+              f"— scoring {len(ms2_file_paths)} MS2 file(s)...")
 
-    print(f"All {n_chunks} chunk(s) ready.\n")
-    return chunks
+        for file_path in ms2_file_paths:
+            n = score_chunk_against_file(
+                parsed_scans[file_path],
+                theo_matrix, pair_masses,
+                c_alpha_pep, c_alpha_mod, c_alpha_site,
+                c_beta_pep,  c_beta_mod,  c_beta_site,
+                crosslinker_mass, aa_dict, device,
+                csv_writers[file_path])
+            result_counts[file_path] += n
+            print(f"    {os.path.basename(file_path)}: +{n} hits "
+                  f"(total so far: {result_counts[file_path]})")
 
+        # Explicitly release the chunk before building the next one
+        del theo_matrix, pair_masses
 
-def process_ms2_file(file_path: str,
-                     spectrum_chunks: List[dict],
-                     output_directory: str,
-                     crosslinker_mass: float,
-                     aa_dict: Dict[str, float],
-                     device: torch.device):
-    """
-    Process one MS2 file against the pre-built spectrum_chunks.
+    # ── Close all output files ────────────────────────────────────────────────
+    for file_path, fh in output_handles.items():
+        fh.close()
+        n = result_counts[file_path]
+        if n > 0:
+            out_path = os.path.join(
+                output_directory,
+                f"xl_ds_{os.path.basename(file_path).split('.')[0]}.csv")
+            print(f"  Results written to {out_path}  ({n} rows)")
+        else:
+            print(f"  Warning: No results for {os.path.basename(file_path)}")
 
-    spectrum_chunks is produced by build_spectrum_chunks() in main() before the
-    MS2 file loop and is shared across all files — theoretical spectra are never
-    recomputed.  The MS2 file itself is parsed once, then every chunk is scored
-    against the full scan set before moving to the next chunk.
-    """
-    output_file = os.path.join(output_directory,
-                               f"xl_ds_{os.path.basename(file_path).split('.')[0]}.csv")
-
-    n_chunks = len(spectrum_chunks)
-
-    # ── Parse MS2 file ONCE ───────────────────────────────────────────────────
-    print(f"  Parsing: {file_path}")
-    scans = split_ms2_by_scans(file_path)
-
-    # OPT: use physical core count (not logical) to avoid hyperthreading overhead
-    # on the CPU-bound parsing work.  GPU work serialises on its own stream anyway.
-    num_threads = max(1, (os.cpu_count() or 2) - 1)
-    distributed_scans = distribute_scans(scans, num_threads)
-
-    all_results = []
-
-    # ── Score all scans against each pre-built chunk ──────────────────────────
-    for chunk_idx, chunk in enumerate(spectrum_chunks):
-        print(f"  Scoring chunk {chunk_idx + 1}/{n_chunks} "
-              f"({len(chunk['alpha_peptides']):,} pairs)...")
-
-        output_queue: Queue = Queue()
-        error_queue:  Queue = Queue()
-
-        # OPT: ThreadPoolExecutor is kept (not ProcessPoolExecutor) because:
-        #   - theo_matrix is a GPU tensor and cannot be pickled across processes.
-        #   - The remaining CPU work (scan parsing + numpy ppm filter) releases
-        #     the GIL, so threads still provide genuine parallelism for that part.
-        #   - All GPU calls serialise on the CUDA stream regardless of executor type.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = [
-                executor.submit(
-                    process_scan_group,
-                    scan_group, output_queue,
-                    chunk['theo_matrix'],           chunk['pair_masses'],
-                    chunk['alpha_peptides'],        chunk['alpha_modifications'],
-                    chunk['alpha_crosslink_sites'],
-                    chunk['beta_peptides'],         chunk['beta_modifications'],
-                    chunk['beta_crosslink_sites'],
-                    crosslinker_mass, aa_dict, device
-                )
-                for scan_group in distributed_scans
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"Error in thread: {e}")
-                    traceback.print_exc()
-
-        while not error_queue.empty():
-            thread_idx, error_msg, tb_str = error_queue.get()
-            print(f"\nError in thread {thread_idx}:\n{error_msg}\n{tb_str}")
-
-        while not output_queue.empty():
-            all_results.extend(output_queue.get())
-
-    # ── Write results ─────────────────────────────────────────────────────────
-    if all_results:
-        with open(output_file, 'w', newline='') as out_file:
-            csv_writer = csv.writer(out_file)
-            csv_writer.writerow(['Scan', 'Alpha Peptide', 'Beta Peptide',
-                                 'Alpha XL Site', 'Beta XL Site',
-                                 'Alpha Mass', 'Beta Mass',
-                                 'Theoretical Mass', 'Observed Mass',
-                                 'Mass_Diff', 'PPM_Diff', 'Xcorr'])
-            for result in all_results:
-                csv_writer.writerow(result)
-        print(f"  Results written to {output_file}")
-    else:
-        print("  Warning: No results were generated")
-
-
-def main(peptides_csv_path: str, output_directory: str, ms2_file_paths: List[str], crosslinker_mass: float, aa_dict: Dict[str, float], signature_types: Dict[str, float], device: torch.device, alpha_acc: List[str]):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Read peptides from a single CSV file (returns accessions as 4th value)
-    peptides, modifications, crosslink_sites, accessions = read_peptides(peptides_csv_path)
-
-    # Generate all alpha/beta pair combinations
-    (alpha_peptides, alpha_modifications, alpha_crosslink_sites,
-     beta_peptides, beta_modifications, beta_crosslink_sites) = generate_all_combinations(
-         peptides, modifications, crosslink_sites, accessions, alpha_acc, crosslinker)
-
-    # ── Build spectrum chunks ONCE before the MS2 file loop ───────────────────
-    # The theoretical spectra depend only on the peptide pairs and crosslinker,
-    # not on any individual MS2 file — so we compute them here and reuse the
-    # same chunk list for every file in ms2_file_paths.
-    spectrum_chunks = build_spectrum_chunks(
-        alpha_peptides, alpha_modifications, alpha_crosslink_sites,
-        beta_peptides,  beta_modifications,  beta_crosslink_sites,
-        crosslinker_mass, aa_dict, signature_types, device)
-
-    for file_path in ms2_file_paths:
-        print(f"\nProcessing MS2 file: {file_path}")
-        process_ms2_file(file_path, spectrum_chunks,
-                         output_directory, crosslinker_mass, aa_dict, device)
-        print(f"Finished processing {file_path}")
+    print(f"\nAll {n_chunks} chunk(s) processed.")
 
 if __name__ == "__main__":
     # OPT: Required on Windows (spawn start method) so that multiprocessing.Pool
@@ -1345,7 +1330,7 @@ if __name__ == "__main__":
         'P02652',   # ← replace with your actual protein accession(s)
     ]
     # ─────────────────────────────────────────────────────────────────────────
-    main(peptides_csv_path = r'C:\env\test\IG_ds.csv',
+    main(peptides_csv_path = r'C:\env\test\IGHG3\IGHG3_ds.csv',
          output_directory = r'C:\env\test',
          ms2_file_paths = [
              r"C:\Crux\data\20260511\20260511-TYG_1-HS1-150.ms2",
